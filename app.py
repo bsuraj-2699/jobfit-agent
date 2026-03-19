@@ -379,15 +379,47 @@ def main() -> None:
     st.markdown(
         """
         <style>
+          /* Background that adapts to Streamlit light/dark themes */
           .stApp {
-            background: linear-gradient(180deg, #f6fbf7 0%, #f8fafc 60%, #ffffff 100%);
+            --jobfit-bg-top: #f6fbf7;
+            --jobfit-bg-mid: #f8fafc;
+            --jobfit-bg-bottom: #ffffff;
+
+            background:
+              radial-gradient(1200px circle at 15% 10%, rgba(16,185,129,0.16) 0%, rgba(16,185,129,0) 45%),
+              radial-gradient(900px circle at 85% 20%, rgba(59,130,246,0.14) 0%, rgba(59,130,246,0) 50%),
+              linear-gradient(180deg, var(--jobfit-bg-top) 0%, var(--jobfit-bg-mid) 60%, var(--jobfit-bg-bottom) 100%);
           }
+
+          /* When Streamlit dark mode is active */
+          html[data-theme="dark"] .stApp,
+          body[data-theme="dark"] .stApp,
+          .stApp[data-theme="dark"] {
+            --jobfit-bg-top: #0b1220;
+            --jobfit-bg-mid: #0f172a;
+            --jobfit-bg-bottom: #0b1220;
+            color-scheme: dark;
+          }
+
+          @media (prefers-color-scheme: dark) {
+            .stApp {
+              --jobfit-bg-top: #0b1220;
+              --jobfit-bg-mid: #0f172a;
+              --jobfit-bg-bottom: #0b1220;
+              color-scheme: dark;
+            }
+          }
+
           /* Make Streamlit chrome blend with background */
           [data-testid="stHeader"], [data-testid="stToolbar"] {
-            background: transparent;
+            background: transparent !important;
           }
-          /* Slightly soften containers */
-          div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stMarkdownContainer"]) {
+
+          /* Slightly soften blocks */
+          div[data-testid="stVerticalBlock"] {
+            border-radius: 14px;
+          }
+          div[data-testid="stMarkdownContainer"] {
             border-radius: 14px;
           }
         </style>
@@ -414,14 +446,14 @@ def main() -> None:
                 st.markdown(
                     "<div style='text-align: right; padding-top: 0.75rem;'>"
                     "<span style='background-color: #14532d; color: #bbf7d0; padding: 0.25rem 0.75rem;"
-                    "</div>",
+                    "</span></div>",
                     unsafe_allow_html=True,
                 )
             else:
                 st.markdown(
                     "<div style='text-align: right; padding-top: 0.75rem;'>"
                     "<span style='background-color: #7f1d1d; color: #fecaca; padding: 0.25rem 0.75rem;"
-                    "</div>",
+                    "</span></div>",
                     unsafe_allow_html=True,
                 )
 
