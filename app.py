@@ -2,6 +2,7 @@ import json
 import os
 import html
 import io
+import base64
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -58,22 +59,30 @@ Projects
 """.strip()
 
 
-def render_logo(logo_path: str, width: int = 180) -> None:
+def render_logo(logo_path: str, width: int = 120, align: str = "left") -> None:
     """
-    Display a left-aligned logo with white background removed and tight-cropped.
-    Falls back to the raw image if processing fails.
+    Render a transparent, tight-cropped logo.
+
+    We embed the processed image directly in HTML to avoid Streamlit's image
+    wrapper introducing a "white tile" background in some themes.
     """
+
+    align = align.lower().strip()
+    if align not in {"left", "center"}:
+        align = "left"
+    margin_style = "margin: 0;" if align == "left" else "margin: 0 auto;"
+
     try:
         with Image.open(logo_path) as im:
             im = im.convert("RGBA")
             pixels = im.getdata()
             new_pixels = []
-            # Remove near-white "tile" pixels more conservatively:
+            # Remove near-white "tile" pixels conservatively:
             # - require very high brightness
             # - and require the color channels to be close (grey/white)
             # This avoids deleting light parts of the logo itself.
-            WHITE_CUTOFF = 250
-            GREY_TOL = 8
+            WHITE_CUTOFF = 245
+            GREY_TOL = 15
             for r, g, b, a in pixels:
                 if a == 0:
                     new_pixels.append((r, g, b, a))
@@ -85,18 +94,44 @@ def render_logo(logo_path: str, width: int = 180) -> None:
                     new_pixels.append((r, g, b, a))
             im.putdata(new_pixels)
 
+            # Tight-crop to the non-transparent content.
             bbox = im.getbbox()
             if bbox:
                 im = im.crop(bbox)
 
             buf = io.BytesIO()
             im.save(buf, format="PNG")
-            st.image(buf.getvalue(), width=width)
-            return
+            png_bytes = buf.getvalue()
+        b64 = base64.b64encode(png_bytes).decode("ascii")
+        st.markdown(
+            (
+                "<img "
+                f"src='data:image/png;base64,{b64}' "
+                f"style='width:{width}px; height:auto; background: transparent; display:block; {margin_style}' "
+                "/>"
+            ),
+            unsafe_allow_html=True,
+        )
+        return
     except Exception:
         pass
 
-    st.image(logo_path, width=width)
+    # Fallback: embed the raw image without processing.
+    try:
+        with open(logo_path, "rb") as f:
+            png_bytes = f.read()
+        b64 = base64.b64encode(png_bytes).decode("ascii")
+        st.markdown(
+            (
+                "<img "
+                f"src='data:image/{os.path.splitext(logo_path)[1].lstrip('.').lower()};base64,{b64}' "
+                f"style='width:{width}px; height:auto; display:block; {margin_style}' "
+                "/>"
+            ),
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        st.image(logo_path, width=width)
 
 
 def load_api_key() -> str:
@@ -382,92 +417,13 @@ def main() -> None:
         layout="wide",
     )
 
-    # App theming
-    st.markdown(
-        """
-        <style>
-          /* Background that adapts to Streamlit light/dark themes */
-          .stApp {
-            --jobfit-bg-top: #f6fbf7;
-            --jobfit-bg-mid: #f8fafc;
-            --jobfit-bg-bottom: #ffffff;
-
-            background:
-              radial-gradient(1200px circle at 15% 10%, rgba(16,185,129,0.16) 0%, rgba(16,185,129,0) 45%),
-              radial-gradient(900px circle at 85% 20%, rgba(59,130,246,0.14) 0%, rgba(59,130,246,0) 50%),
-              linear-gradient(180deg, var(--jobfit-bg-top) 0%, var(--jobfit-bg-mid) 60%, var(--jobfit-bg-bottom) 100%);
-          }
-
-          /* When Streamlit dark mode is active */
-          html[data-theme="dark"] .stApp,
-          body[data-theme="dark"] .stApp,
-          .stApp[data-theme="dark"] {
-            --jobfit-bg-top: #0b1220;
-            --jobfit-bg-mid: #0f172a;
-            --jobfit-bg-bottom: #0b1220;
-            color-scheme: dark;
-          }
-
-          /* Dark mode: ensure app text stays high-contrast */
-          html[data-theme="dark"] .stApp,
-          body[data-theme="dark"] .stApp,
-          .stApp[data-theme="dark"] {
-            color: #e5e7eb !important;
-          }
-          html[data-theme="dark"] .stApp h1,
-          html[data-theme="dark"] .stApp h2,
-          html[data-theme="dark"] .stApp h3,
-          html[data-theme="dark"] .stApp h4,
-          html[data-theme="dark"] .stApp h5,
-          html[data-theme="dark"] .stApp p,
-          html[data-theme="dark"] .stApp span,
-          html[data-theme="dark"] .stApp label {
-            color: #e5e7eb !important;
-            opacity: 1 !important;
-          }
-
-          @media (prefers-color-scheme: dark) {
-            .stApp {
-              --jobfit-bg-top: #0b1220;
-              --jobfit-bg-mid: #0f172a;
-              --jobfit-bg-bottom: #0b1220;
-              color-scheme: dark;
-              color: #e5e7eb !important;
-            }
-          }
-
-          /* Make Streamlit chrome blend with background */
-          [data-testid="stHeader"], [data-testid="stToolbar"] {
-            background: transparent !important;
-          }
-
-          /* Slightly soften blocks */
-          div[data-testid="stVerticalBlock"] {
-            border-radius: 14px;
-          }
-          div[data-testid="stMarkdownContainer"] {
-            border-radius: 14px;
-          }
-
-          /* Dark mode: remove any white tile behind the logo image */
-          [data-testid="stImage"] {
-            background: transparent !important;
-          }
-          [data-testid="stImage"] > div {
-            background: transparent !important;
-          }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
     header_left, header_right = st.columns([3, 1])
 
     with header_left:
         # App logo
         logo_path = "logo.png"
         if os.path.exists(logo_path):
-            render_logo(logo_path, width=180)
+            render_logo(logo_path, width=120, align="left")
 
         st.title("JobFit Agent")
         st.caption("Analyze the job-resume fit")
@@ -476,20 +432,13 @@ def main() -> None:
         api_key_present = bool(load_api_key())
         status_container = st.container()
         with status_container:
-            if api_key_present:
-                st.markdown(
-                    "<div style='text-align: right; padding-top: 0.75rem;'>"
-                    "<span style='background-color: #14532d; color: #bbf7d0; padding: 0.25rem 0.75rem;"
-                    "</span></div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    "<div style='text-align: right; padding-top: 0.75rem;'>"
-                    "<span style='background-color: #7f1d1d; color: #fecaca; padding: 0.25rem 0.75rem;"
-                    "</span></div>",
-                    unsafe_allow_html=True,
-                )
+            # Let Streamlit apply theme-appropriate colors.
+            _, status_col = st.columns([3, 1])
+            with status_col:
+                if api_key_present:
+                    st.success("API key loaded")
+                else:
+                    st.error("API key missing")
 
     st.markdown("---")
 
@@ -550,44 +499,16 @@ def main() -> None:
             st.markdown("### Matching Skills")
             if result["matching_skills"]:
                 skills = sorted(set(result["matching_skills"]))
-                cards_html = "".join(
-                    [
-                        (
-                            "<div style='background-color:#dcfce7;color:#14532d;"
-                            "padding:8px 10px;border-radius:12px;margin:4px;"
-                            "display:inline-block;font-size:0.92rem;line-height:1.2;'>"
-                            f"{html.escape(skill)}"
-                            "</div>"
-                        )
-                        for skill in skills
-                    ]
-                )
-                st.markdown(
-                    f"<div style='display:flex;flex-wrap:wrap;'>{cards_html}</div>",
-                    unsafe_allow_html=True,
-                )
+                bullets = "\n".join([f"- {html.escape(skill)}" for skill in skills])
+                st.markdown(bullets)
             else:
                 st.write("No clear overlapping skills or keywords detected.")
 
             st.markdown("### Missing Skills")
             if result["missing_skills"]:
                 skills = sorted(set(result["missing_skills"]))
-                cards_html = "".join(
-                    [
-                        (
-                            "<div style='background-color:#fee2e2;color:#7f1d1d;"
-                            "padding:8px 10px;border-radius:12px;margin:4px;"
-                            "display:inline-block;font-size:0.92rem;line-height:1.2;'>"
-                            f"{html.escape(skill)}"
-                            "</div>"
-                        )
-                        for skill in skills
-                    ]
-                )
-                st.markdown(
-                    f"<div style='display:flex;flex-wrap:wrap;'>{cards_html}</div>",
-                    unsafe_allow_html=True,
-                )
+                bullets = "\n".join([f"- {html.escape(skill)}" for skill in skills])
+                st.markdown(bullets)
             else:
                 st.write("No obvious missing skills or keywords detected.")
 
