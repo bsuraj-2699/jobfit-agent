@@ -68,11 +68,18 @@ def render_logo(logo_path: str, width: int = 180) -> None:
             im = im.convert("RGBA")
             pixels = im.getdata()
             new_pixels = []
-            # Remove near-white pixels (typical "white box" background)
+            # Remove near-white "tile" pixels more conservatively:
+            # - require very high brightness
+            # - and require the color channels to be close (grey/white)
+            # This avoids deleting light parts of the logo itself.
+            WHITE_CUTOFF = 250
+            GREY_TOL = 8
             for r, g, b, a in pixels:
                 if a == 0:
                     new_pixels.append((r, g, b, a))
-                elif r >= 245 and g >= 245 and b >= 245:
+                elif r >= WHITE_CUTOFF and g >= WHITE_CUTOFF and b >= WHITE_CUTOFF and (
+                    abs(r - g) <= GREY_TOL and abs(g - b) <= GREY_TOL
+                ):
                     new_pixels.append((r, g, b, 0))
                 else:
                     new_pixels.append((r, g, b, a))
@@ -401,12 +408,31 @@ def main() -> None:
             color-scheme: dark;
           }
 
+          /* Dark mode: ensure app text stays high-contrast */
+          html[data-theme="dark"] .stApp,
+          body[data-theme="dark"] .stApp,
+          .stApp[data-theme="dark"] {
+            color: #e5e7eb !important;
+          }
+          html[data-theme="dark"] .stApp h1,
+          html[data-theme="dark"] .stApp h2,
+          html[data-theme="dark"] .stApp h3,
+          html[data-theme="dark"] .stApp h4,
+          html[data-theme="dark"] .stApp h5,
+          html[data-theme="dark"] .stApp p,
+          html[data-theme="dark"] .stApp span,
+          html[data-theme="dark"] .stApp label {
+            color: #e5e7eb !important;
+            opacity: 1 !important;
+          }
+
           @media (prefers-color-scheme: dark) {
             .stApp {
               --jobfit-bg-top: #0b1220;
               --jobfit-bg-mid: #0f172a;
               --jobfit-bg-bottom: #0b1220;
               color-scheme: dark;
+              color: #e5e7eb !important;
             }
           }
 
@@ -421,6 +447,14 @@ def main() -> None:
           }
           div[data-testid="stMarkdownContainer"] {
             border-radius: 14px;
+          }
+
+          /* Dark mode: remove any white tile behind the logo image */
+          [data-testid="stImage"] {
+            background: transparent !important;
+          }
+          [data-testid="stImage"] > div {
+            background: transparent !important;
           }
         </style>
         """,
