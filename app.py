@@ -1,5 +1,7 @@
 import json
 import os
+import html
+import io
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -8,6 +10,86 @@ from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 from pypdf import PdfReader
 from docx import Document
+from PIL import Image
+
+
+SAMPLE_JOB_DESCRIPTION = """
+Software Engineer (Backend) - Job Description
+
+We are looking for a backend engineer to build and maintain REST APIs and data pipelines.
+
+Responsibilities
+- Develop Python services and backend REST endpoints (FastAPI / Flask)
+- Write efficient SQL for PostgreSQL and optimize queries
+- Deploy and operate services on AWS (Lambda / S3 / API Gateway)
+- Containerize applications using Docker and support CI/CD workflows
+
+Preferred Qualifications
+- Experience integrating with React frontends
+- Familiarity with Kubernetes and IaC (Terraform)
+- Strong testing practices (unit/integration)
+
+Key Skills
+Python, REST APIs, FastAPI, SQL, PostgreSQL, AWS, Docker, CI/CD, React, Kubernetes, Terraform
+""".strip()
+
+
+SAMPLE_RESUME = """
+Jane Candidate
+Backend Engineer | Python, AWS, SQL, Docker
+
+Summary
+Backend engineer with 5+ years building REST APIs and data-driven services.
+Strong experience with Python/FastAPI, PostgreSQL, AWS Lambda, and Docker-based deployments.
+
+Experience
+Backend Developer, Acme Analytics (2021 - Present)
+- Built REST APIs using FastAPI and deployed them with AWS Lambda and API Gateway.
+- Wrote and optimized PostgreSQL queries (joins, indexing strategies, query performance tuning).
+- Containerized services with Docker; improved deployment consistency across environments.
+- Implemented CI/CD pipelines (GitHub Actions) and added unit/integration tests for critical endpoints.
+
+Skills
+Python, FastAPI, Flask, PostgreSQL, SQL, REST APIs, AWS Lambda, S3, API Gateway, Docker, CI/CD
+
+Projects
+- API service for reporting dashboards (FastAPI + PostgreSQL + AWS)
+- ETL jobs for transforming raw events into analytics tables
+""".strip()
+
+
+def render_logo(logo_path: str, width: int = 180) -> None:
+    """
+    Display a left-aligned logo with white background removed and tight-cropped.
+    Falls back to the raw image if processing fails.
+    """
+    try:
+        with Image.open(logo_path) as im:
+            im = im.convert("RGBA")
+            pixels = im.getdata()
+            new_pixels = []
+            # Remove near-white pixels (typical "white box" background)
+            for r, g, b, a in pixels:
+                if a == 0:
+                    new_pixels.append((r, g, b, a))
+                elif r >= 245 and g >= 245 and b >= 245:
+                    new_pixels.append((r, g, b, 0))
+                else:
+                    new_pixels.append((r, g, b, a))
+            im.putdata(new_pixels)
+
+            bbox = im.getbbox()
+            if bbox:
+                im = im.crop(bbox)
+
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            st.image(buf.getvalue(), width=width)
+            return
+    except Exception:
+        pass
+
+    st.image(logo_path, width=width)
 
 
 def load_api_key() -> str:
@@ -208,6 +290,7 @@ def fetch_text_from_url(url: str) -> str:
 def get_text_input_block(
     label: str,
     placeholder: str,
+    sample_text: Optional[str] = None,
 ) -> tuple[str, bool]:
     """
     Composite input allowing:
@@ -216,6 +299,15 @@ def get_text_input_block(
     - URL to fetch content from
     """
     st.markdown(f"#### {label}")
+    state_key = f"{label.lower().replace(' ', '_')}_text"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = ""
+
+    if sample_text:
+        if st.button(f"Use Sample {label}", key=f"{state_key}_sample", type="secondary"):
+            st.session_state[state_key] = sample_text
+            st.rerun()
+
     tabs = st.tabs(["Text", "File / URL"])
 
     text_value: str = ""
@@ -226,7 +318,7 @@ def get_text_input_block(
             f"{label} (Text)",
             placeholder=placeholder,
             height=260,
-            key=f"{label.lower().replace(' ', '_')}_text",
+            key=state_key,
         )
         if text_value.strip():
             has_content = True
@@ -283,13 +375,33 @@ def main() -> None:
         layout="wide",
     )
 
+    # App theming
+    st.markdown(
+        """
+        <style>
+          .stApp {
+            background: linear-gradient(180deg, #f6fbf7 0%, #f8fafc 60%, #ffffff 100%);
+          }
+          /* Make Streamlit chrome blend with background */
+          [data-testid="stHeader"], [data-testid="stToolbar"] {
+            background: transparent;
+          }
+          /* Slightly soften containers */
+          div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stMarkdownContainer"]) {
+            border-radius: 14px;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     header_left, header_right = st.columns([3, 1])
 
     with header_left:
         # App logo
         logo_path = "logo.png"
         if os.path.exists(logo_path):
-            st.image(logo_path, width=300)
+            render_logo(logo_path, width=180)
 
         st.title("JobFit Agent")
         st.caption("Analyze the job-resume fit")
@@ -321,12 +433,14 @@ def main() -> None:
         job_description, has_jd = get_text_input_block(
             label="Job Description",
             placeholder="Paste the full job description here or use the File / URL tab...",
+            sample_text=SAMPLE_JOB_DESCRIPTION,
         )
 
     with col2:
         resume, has_resume = get_text_input_block(
             label="Resume",
             placeholder="Paste the candidate's resume here or use the File / URL tab...",
+            sample_text=SAMPLE_RESUME,
         )
 
     analyze_clicked = st.button("Analyze Fit", type="primary")
@@ -350,10 +464,8 @@ def main() -> None:
         st.subheader("Match Overview")
         score_col, verdict_col = st.columns(2)
         with score_col:
-            st.metric(
-                label="Match Score",
-                value=f"{result['match_score']:.1f} / 100",
-            )
+            match_score = float(result["match_score"])
+            st.progress(match_score / 100.0, text=f"Match Score: {match_score:.1f} / 100")
         with verdict_col:
             verdict_badge = result["verdict"]
             if verdict_badge == "Strong Apply":
@@ -371,13 +483,45 @@ def main() -> None:
         with skills_col:
             st.markdown("### Matching Skills")
             if result["matching_skills"]:
-                st.write(", ".join(sorted(set(result["matching_skills"]))))
+                skills = sorted(set(result["matching_skills"]))
+                cards_html = "".join(
+                    [
+                        (
+                            "<div style='background-color:#dcfce7;color:#14532d;"
+                            "padding:8px 10px;border-radius:12px;margin:4px;"
+                            "display:inline-block;font-size:0.92rem;line-height:1.2;'>"
+                            f"{html.escape(skill)}"
+                            "</div>"
+                        )
+                        for skill in skills
+                    ]
+                )
+                st.markdown(
+                    f"<div style='display:flex;flex-wrap:wrap;'>{cards_html}</div>",
+                    unsafe_allow_html=True,
+                )
             else:
                 st.write("No clear overlapping skills or keywords detected.")
 
             st.markdown("### Missing Skills")
             if result["missing_skills"]:
-                st.write(", ".join(sorted(set(result["missing_skills"]))))
+                skills = sorted(set(result["missing_skills"]))
+                cards_html = "".join(
+                    [
+                        (
+                            "<div style='background-color:#fee2e2;color:#7f1d1d;"
+                            "padding:8px 10px;border-radius:12px;margin:4px;"
+                            "display:inline-block;font-size:0.92rem;line-height:1.2;'>"
+                            f"{html.escape(skill)}"
+                            "</div>"
+                        )
+                        for skill in skills
+                    ]
+                )
+                st.markdown(
+                    f"<div style='display:flex;flex-wrap:wrap;'>{cards_html}</div>",
+                    unsafe_allow_html=True,
+                )
             else:
                 st.write("No obvious missing skills or keywords detected.")
 
