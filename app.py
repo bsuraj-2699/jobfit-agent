@@ -413,7 +413,7 @@ def get_text_input_block(
 def main() -> None:
     st.set_page_config(
         page_title="JobFit Agent",
-        page_icon="📄",
+        page_icon="logo.png",
         layout="wide",
     )
 
