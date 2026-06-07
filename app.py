@@ -1,17 +1,149 @@
 import json
+import logging
 import os
 import html
 import io
 import base64
 from typing import Any, Dict, List, Optional
 
-import requests
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 from pypdf import PdfReader
 from docx import Document
 from PIL import Image
+
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("jobfit-agent")
+
+# --- Configuration -----------------------------------------------------------
+# Guardrails to keep API cost, latency, and request size bounded.
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "30000"))
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "60"))
+# Generous enough to cover "thinking" models (e.g. Gemini 2.5 Flash) that spend
+# part of the token budget on internal reasoning before emitting the answer.
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "4096"))
+
+# --- Multi-provider support --------------------------------------------------
+# Whichever API key is present in the environment selects the provider. Most
+# providers expose an OpenAI-compatible Chat Completions endpoint, so they share
+# one client (just a different base_url). Anthropic (Claude) is the exception:
+# it uses the official `anthropic` SDK, not an OpenAI-compatibility shim.
+#
+# A best-fit default model is chosen per provider for this JSON evaluation task;
+# override any of them with the listed env var, or force a global model with
+# LLM_MODEL and a specific provider with LLM_PROVIDER.
+PROVIDERS: Dict[str, Dict[str, Any]] = {
+    "openai": {
+        "label": "OpenAI",
+        "kind": "openai",
+        "env_keys": ["OPENAI_API_KEY"],
+        "model_env": "OPENAI_MODEL",
+        "default_model": "gpt-4o",
+        "base_url": None,
+    },
+    "anthropic": {
+        "label": "Anthropic Claude",
+        "kind": "anthropic",
+        "env_keys": ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
+        "model_env": "ANTHROPIC_MODEL",
+        "default_model": "claude-opus-4-8",
+        "base_url": None,
+    },
+    "gemini": {
+        "label": "Google Gemini",
+        "kind": "openai",
+        "env_keys": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "model_env": "GEMINI_MODEL",
+        "default_model": "gemini-2.5-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    },
+    "groq": {
+        "label": "Groq",
+        "kind": "openai",
+        "env_keys": ["GROQ_API_KEY"],
+        "model_env": "GROQ_MODEL",
+        "default_model": "llama-3.3-70b-versatile",
+        "base_url": "https://api.groq.com/openai/v1",
+    },
+    "mistral": {
+        "label": "Mistral",
+        "kind": "openai",
+        "env_keys": ["MISTRAL_API_KEY"],
+        "model_env": "MISTRAL_MODEL",
+        "default_model": "mistral-large-latest",
+        "base_url": "https://api.mistral.ai/v1",
+    },
+}
+
+# Detection order when no LLM_PROVIDER is forced (first key found wins).
+PROVIDER_ORDER = ["openai", "anthropic", "gemini", "groq", "mistral"]
+
+# JSON schema for Anthropic structured outputs (guarantees parseable JSON).
+JOBFIT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "match_score": {"type": "number"},
+        "matching_skills": {"type": "array", "items": {"type": "string"}},
+        "missing_skills": {"type": "array", "items": {"type": "string"}},
+        "resume_improvements": {"type": "array", "items": {"type": "string"}},
+        "verdict": {
+            "type": "string",
+            "enum": ["Strong Apply", "Apply with Modifications", "Skip"],
+        },
+    },
+    "required": [
+        "match_score",
+        "matching_skills",
+        "missing_skills",
+        "resume_improvements",
+        "verdict",
+    ],
+    "additionalProperties": False,
+}
+
+
+def detect_provider() -> tuple[Optional[str], Optional[str]]:
+    """Return (provider_name, api_key) based on env vars, or (None, None).
+
+    Honors an explicit LLM_PROVIDER override; otherwise picks the first
+    provider in PROVIDER_ORDER whose API key is set.
+    """
+    load_dotenv()
+
+    forced = os.getenv("LLM_PROVIDER", "").strip().lower()
+    if forced:
+        if forced not in PROVIDERS:
+            logger.warning("Unknown LLM_PROVIDER=%r; ignoring.", forced)
+        else:
+            for env_key in PROVIDERS[forced]["env_keys"]:
+                value = os.getenv(env_key, "").strip()
+                if value:
+                    return forced, value
+            return forced, None  # forced but key missing — surfaced to user
+
+    for name in PROVIDER_ORDER:
+        for env_key in PROVIDERS[name]["env_keys"]:
+            value = os.getenv(env_key, "").strip()
+            if value:
+                return name, value
+    return None, None
+
+
+def resolve_model(provider: str) -> str:
+    """Pick the model for a provider: LLM_MODEL > <PROVIDER>_MODEL > default."""
+    override = os.getenv("LLM_MODEL", "").strip()
+    if override:
+        return override
+    spec = PROVIDERS[provider]
+    per_provider = os.getenv(spec["model_env"], "").strip()
+    if per_provider:
+        return per_provider
+    return spec["default_model"]
 
 
 SAMPLE_JOB_DESCRIPTION = """
@@ -32,30 +164,6 @@ Preferred Qualifications
 
 Key Skills
 Python, REST APIs, FastAPI, SQL, PostgreSQL, AWS, Docker, CI/CD, React, Kubernetes, Terraform
-""".strip()
-
-
-SAMPLE_RESUME = """
-Jane Candidate
-Backend Engineer | Python, AWS, SQL, Docker
-
-Summary
-Backend engineer with 5+ years building REST APIs and data-driven services.
-Strong experience with Python/FastAPI, PostgreSQL, AWS Lambda, and Docker-based deployments.
-
-Experience
-Backend Developer, Acme Analytics (2021 - Present)
-- Built REST APIs using FastAPI and deployed them with AWS Lambda and API Gateway.
-- Wrote and optimized PostgreSQL queries (joins, indexing strategies, query performance tuning).
-- Containerized services with Docker; improved deployment consistency across environments.
-- Implemented CI/CD pipelines (GitHub Actions) and added unit/integration tests for critical endpoints.
-
-Skills
-Python, FastAPI, Flask, PostgreSQL, SQL, REST APIs, AWS Lambda, S3, API Gateway, Docker, CI/CD
-
-Projects
-- API service for reporting dashboards (FastAPI + PostgreSQL + AWS)
-- ETL jobs for transforming raw events into analytics tables
 """.strip()
 
 
@@ -134,19 +242,7 @@ def render_logo(logo_path: str, width: int = 120, align: str = "left") -> None:
         st.image(logo_path, width=width)
 
 
-def load_api_key() -> str:
-    load_dotenv()
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    return api_key
-
-
-def get_openai_client() -> OpenAI:
-    api_key = load_api_key()
-    if not api_key:
-        raise RuntimeError(
-            "OpenAI API key is missing. Please set OPENAI_API_KEY in your .env file."
-        )
-    return OpenAI(api_key=api_key)
+SYSTEM_PROMPT = "You are a precise JSON-generating assistant."
 
 
 def build_prompt(job_description: str, resume: str) -> str:
@@ -213,50 +309,149 @@ Rules:
 """
 
 
-def call_jobfit_agent(job_description: str, resume: str) -> Dict[str, Any]:
-    client = get_openai_client()
-    prompt = build_prompt(job_description, resume)
+def _truncate(text: str, limit: int = MAX_INPUT_CHARS) -> str:
+    """Clamp very long inputs to keep token usage and cost bounded."""
+    if len(text) <= limit:
+        return text
+    logger.warning("Input truncated from %d to %d characters.", len(text), limit)
+    return text[:limit]
 
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a precise JSON-generating assistant.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-        )
-    except OpenAIError as e:
-        raise RuntimeError(f"OpenAI API call failed: {e}") from e
 
-    try:
-        content = response.choices[0].message.content
-    except (AttributeError, IndexError) as e:
-        raise RuntimeError("Unexpected OpenAI API response format.") from e
-
+def _parse_json_response(content: Optional[str]) -> Dict[str, Any]:
+    """Parse a model's text response into JSON, tolerating markdown fences."""
     if not content:
-        raise RuntimeError("OpenAI returned an empty response.")
+        raise RuntimeError("The model returned an empty response.")
 
-    # In case the model accidentally includes markdown fences, strip them.
-    content_stripped = content.strip()
-    if content_stripped.startswith("```"):
-        # Remove leading/trailing code fences
-        content_stripped = content_stripped.strip("`")
-        # Try to remove possible language tag like json\n at the start
-        if "\n" in content_stripped:
-            first_line, rest = content_stripped.split("\n", 1)
+    stripped = content.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`")
+        if "\n" in stripped:
+            first_line, rest = stripped.split("\n", 1)
             if first_line.lower() in {"json", "javascript", "ts"}:
-                content_stripped = rest
+                stripped = rest
 
     try:
-        parsed = json.loads(content_stripped)
+        return json.loads(stripped)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"Failed to parse JSON from model response: {e}\nRaw content:\n{content}") from e
+        raise RuntimeError(
+            f"Failed to parse JSON from model response: {e}\nRaw content:\n{content}"
+        ) from e
 
-    return parsed
+
+def _call_openai_compatible(
+    provider: str, api_key: str, model: str, prompt: str
+) -> Dict[str, Any]:
+    """Call any OpenAI-compatible Chat Completions endpoint (OpenAI/Gemini/Groq/Mistral)."""
+    base_url = PROVIDERS[provider]["base_url"]
+    client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+
+    def _create(use_json: bool):
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "timeout": REQUEST_TIMEOUT_SECONDS,
+        }
+        if use_json:
+            kwargs["response_format"] = {"type": "json_object"}
+        return client.chat.completions.create(**kwargs)
+
+    try:
+        response = _create(use_json=True)
+    except OpenAIError:
+        # Some providers/models reject response_format — retry without JSON mode.
+        logger.warning("%s rejected JSON mode; retrying without it.", provider)
+        try:
+            response = _create(use_json=False)
+        except OpenAIError as e:
+            logger.exception("%s API call failed.", provider)
+            raise RuntimeError(f"{PROVIDERS[provider]['label']} API call failed: {e}") from e
+
+    try:
+        choice = response.choices[0]
+        content = choice.message.content
+    except (AttributeError, IndexError) as e:
+        raise RuntimeError("Unexpected API response format.") from e
+
+    # If the model hit the token cap, the JSON is cut off mid-string. Give a
+    # clear, actionable error instead of a confusing JSON parse failure.
+    if getattr(choice, "finish_reason", None) == "length":
+        raise RuntimeError(
+            "The model's response was cut off (token limit reached) before it "
+            "could finish the JSON. Try again, or increase MAX_OUTPUT_TOKENS in "
+            "your .env (some models spend many tokens on internal reasoning)."
+        )
+
+    return _parse_json_response(content)
+
+
+def _call_anthropic(api_key: str, model: str, prompt: str) -> Dict[str, Any]:
+    """Call Claude via the official Anthropic SDK with structured JSON output."""
+    import anthropic  # imported lazily so the dep is only needed for the Claude path
+
+    client = anthropic.Anthropic(api_key=api_key)
+    # Note: Opus 4.x rejects temperature/top_p/budget_tokens — do not pass them.
+    base_kwargs: Dict[str, Any] = {
+        "model": model,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "system": SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": prompt}],
+        "timeout": REQUEST_TIMEOUT_SECONDS,
+    }
+
+    try:
+        # Structured outputs guarantee schema-valid JSON on supported models.
+        response = client.messages.create(
+            **base_kwargs,
+            output_config={"format": {"type": "json_schema", "schema": JOBFIT_SCHEMA}},
+        )
+    except (anthropic.APIError, TypeError) as first_error:
+        # Fall back to a plain call (older SDKs / models without structured outputs).
+        logger.warning("Anthropic structured output unavailable (%s); falling back.", first_error)
+        try:
+            response = client.messages.create(**base_kwargs)
+        except anthropic.APIError as e:
+            logger.exception("Anthropic API call failed.")
+            raise RuntimeError(f"Anthropic Claude API call failed: {e}") from e
+
+    if getattr(response, "stop_reason", None) == "max_tokens":
+        raise RuntimeError(
+            "The model's response was cut off (token limit reached) before it "
+            "could finish the JSON. Try again, or increase MAX_OUTPUT_TOKENS in your .env."
+        )
+
+    content = next(
+        (block.text for block in response.content if getattr(block, "type", None) == "text"),
+        None,
+    )
+    return _parse_json_response(content)
+
+
+def call_jobfit_agent(job_description: str, resume: str) -> Dict[str, Any]:
+    provider, api_key = detect_provider()
+    if not provider:
+        raise RuntimeError(
+            "No API key found. Set one of OPENAI_API_KEY, ANTHROPIC_API_KEY, "
+            "GEMINI_API_KEY, GROQ_API_KEY, or MISTRAL_API_KEY in your .env file."
+        )
+    if not api_key:
+        raise RuntimeError(
+            f"LLM_PROVIDER is set to '{provider}', but its API key is not set. "
+            f"Set {PROVIDERS[provider]['env_keys'][0]} in your .env file."
+        )
+
+    model = resolve_model(provider)
+    logger.info("Using provider=%s model=%s", provider, model)
+    prompt = build_prompt(_truncate(job_description), _truncate(resume))
+
+    if PROVIDERS[provider]["kind"] == "anthropic":
+        return _call_anthropic(api_key, model, prompt)
+    return _call_openai_compatible(provider, api_key, model, prompt)
 
 
 def validate_result(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -305,6 +500,7 @@ def extract_text_from_pdf(file) -> str:
         pages_text = [page.extract_text() or "" for page in reader.pages]
         return "\n".join(pages_text).strip()
     except Exception:
+        logger.exception("Failed to extract text from PDF.")
         return ""
 
 
@@ -314,100 +510,70 @@ def extract_text_from_docx(file) -> str:
         paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
         return "\n".join(paragraphs).strip()
     except Exception:
+        logger.exception("Failed to extract text from DOCX.")
         return ""
 
 
-def fetch_text_from_url(url: str) -> str:
-    url = url.strip()
-    if not url:
-        return ""
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        return response.text
-    except Exception:
-        return ""
-
-
-def get_text_input_block(
-    label: str,
-    placeholder: str,
-    sample_text: Optional[str] = None,
-) -> tuple[str, bool]:
-    """
-    Composite input allowing:
-    - Direct text paste
-    - File upload (PDF/DOCX/TXT)
-    - URL to fetch content from
-    """
+def get_job_description_input() -> tuple[str, bool]:
+    """Job Description input: paste-only text area."""
+    label = "Job Description"
     st.markdown(f"#### {label}")
-    state_key = f"{label.lower().replace(' ', '_')}_text"
+    state_key = "job_description_text"
     if state_key not in st.session_state:
         st.session_state[state_key] = ""
 
-    if sample_text:
-        if st.button(f"Use Sample {label}", key=f"{state_key}_sample", type="secondary"):
-            st.session_state[state_key] = sample_text
-            st.rerun()
+    if st.button(f"Use Sample {label}", key=f"{state_key}_sample", type="secondary"):
+        st.session_state[state_key] = SAMPLE_JOB_DESCRIPTION
+        st.rerun()
 
-    tabs = st.tabs(["Text", "File / URL"])
+    text_value = st.text_area(
+        f"{label} (Text)",
+        placeholder="Paste the full job description here...",
+        height=320,
+        key=state_key,
+    )
 
-    text_value: str = ""
-    has_content = False
+    return text_value.strip(), bool(text_value.strip())
 
-    with tabs[0]:
-        text_value = st.text_area(
-            f"{label} (Text)",
-            placeholder=placeholder,
-            height=260,
-            key=state_key,
+
+def get_resume_input() -> tuple[str, bool]:
+    """Resume input: file upload only (PDF / Word / TXT)."""
+    label = "Resume"
+    st.markdown(f"#### {label}")
+
+    uploaded_file = st.file_uploader(
+        f"{label} file (PDF / Word / TXT)",
+        type=["pdf", "docx", "txt"],
+        key="resume_file",
+    )
+
+    if uploaded_file is None:
+        return "", False
+
+    if uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(".pdf"):
+        extracted_text = extract_text_from_pdf(uploaded_file)
+    elif uploaded_file.type in (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+    ) or uploaded_file.name.lower().endswith(".docx"):
+        extracted_text = extract_text_from_docx(uploaded_file)
+    else:
+        # Fallback for plain text
+        try:
+            extracted_text = uploaded_file.read().decode("utf-8", errors="ignore")
+        except Exception:
+            extracted_text = ""
+
+    extracted_text = extracted_text.strip()
+    if not extracted_text:
+        st.warning(
+            "Could not extract any text from the uploaded file. "
+            "It may be empty, image-only/scanned, or corrupted."
         )
-        if text_value.strip():
-            has_content = True
+        return "", False
 
-    with tabs[1]:
-        uploaded_file = st.file_uploader(
-            f"{label} file (PDF / Word / TXT)",
-            type=["pdf", "docx", "txt"],
-            key=f"{label.lower().replace(' ', '_')}_file",
-        )
-        url_input = st.text_input(
-            f"{label} URL",
-            placeholder="Paste a link to the JD/Resume (PDF, DOCX, or HTML page)...",
-            key=f"{label.lower().replace(' ', '_')}_url",
-        )
-
-        extracted_text: str = ""
-
-        if uploaded_file is not None:
-            if uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(
-                ".pdf"
-            ):
-                extracted_text = extract_text_from_pdf(uploaded_file)
-            elif uploaded_file.type in (
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "application/msword",
-            ) or uploaded_file.name.lower().endswith(".docx"):
-                extracted_text = extract_text_from_docx(uploaded_file)
-            else:
-                # Fallback for plain text
-                try:
-                    extracted_text = uploaded_file.read().decode("utf-8", errors="ignore")
-                except Exception:
-                    extracted_text = ""
-
-        if not extracted_text and url_input.strip():
-            fetched = fetch_text_from_url(url_input)
-            extracted_text = fetched
-
-        if extracted_text:
-            has_content = True
-            st.info("Content loaded successfully.")
-            # Prefer extracted text when text area is empty
-            if not text_value.strip():
-                text_value = extracted_text
-
-    return text_value.strip(), has_content
+    st.info("Resume loaded successfully.")
+    return extracted_text, True
 
 
 def main() -> None:
@@ -429,40 +595,36 @@ def main() -> None:
         st.caption("Analyze the job-resume fit")
 
     with header_right:
-        api_key_present = bool(load_api_key())
+        provider, api_key = detect_provider()
         status_container = st.container()
         with status_container:
             # Let Streamlit apply theme-appropriate colors.
             _, status_col = st.columns([3, 1])
             with status_col:
-                if api_key_present:
-                    st.success("API key loaded")
+                if provider and api_key:
+                    st.success(
+                        f"{PROVIDERS[provider]['label']}\n\n`{resolve_model(provider)}`"
+                    )
+                elif provider:
+                    st.error(f"{PROVIDERS[provider]['label']} key missing")
                 else:
-                    st.error("API key missing")
+                    st.error("No API key found")
 
     st.markdown("---")
 
     col1, col2 = st.columns(2)
 
     with col1:
-        job_description, has_jd = get_text_input_block(
-            label="Job Description",
-            placeholder="Paste the full job description here or use the File / URL tab...",
-            sample_text=SAMPLE_JOB_DESCRIPTION,
-        )
+        job_description, has_jd = get_job_description_input()
 
     with col2:
-        resume, has_resume = get_text_input_block(
-            label="Resume",
-            placeholder="Paste the candidate's resume here or use the File / URL tab...",
-            sample_text=SAMPLE_RESUME,
-        )
+        resume, has_resume = get_resume_input()
 
     analyze_clicked = st.button("Analyze Fit", type="primary")
 
     if analyze_clicked:
         if not has_jd or not has_resume:
-            st.error("Please provide both a Job Description and a Resume (via text, file, or URL) before analyzing.")
+            st.error("Please paste a Job Description and upload a Resume file before analyzing.")
             return
 
         with st.spinner("Analyzing...."):
@@ -515,9 +677,16 @@ def main() -> None:
         st.divider()
 
         st.markdown("### Resume Improvement Suggestions")
+        has_suggestion = False
         for idx, suggestion in enumerate(result["resume_improvements"], start=1):
             if suggestion.strip():
+                has_suggestion = True
                 st.markdown(f"- **Suggestion {idx}**: {suggestion}")
+        if not has_suggestion:
+            st.write("No improvement suggestions were generated.")
+
+        with st.expander("Raw JSON response"):
+            st.json(result)
 
 
 if __name__ == "__main__":
